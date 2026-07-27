@@ -3,14 +3,18 @@
 # Smart pipeline that checks for updates and maintains the guide
 #
 # Features:
-# - Pre-flight check: Skips full run if no new GitHub release
+# - Pre-flight check: Skips full run if no new version in the upstream CHANGELOG
 # - Dynamic commits: Uses Claude's summary as commit message
 # - Change tracking: Maintains structured JSON log
 # - Error handling: Retries and rollback on failure
 # - State tracking: Remembers last-checked versions
 #
 # Sources:
-# - https://github.com/anthropics/claude-code/releases (primary trigger)
+# - https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md
+#   (primary trigger AND the source of truth for the version list and entry text)
+# - https://github.com/anthropics/claude-code/releases (secondary signal only - it omits
+#   versions that shipped, e.g. v2.1.43 / v2.1.46 / v2.1.120, and some entries have an
+#   empty body, e.g. v2.1.75; use it for publish dates, never for the version list)
 # - https://docs.anthropic.com/en/docs/claude-code (official docs)
 # - https://www.anthropic.com/changelog (product changelog)
 #
@@ -28,6 +32,7 @@ CHANGES_LOG="$GUIDE_DIR/changes.json"
 HUMAN_LOG="$GUIDE_DIR/update-log.md"
 BACKUP_PATH="$GUIDE_DIR/.README.backup.md"
 MAX_RETRIES=2
+CHANGELOG_URL="https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md"
 
 # Ensure PATH includes Claude CLI
 export PATH="/usr/local/bin:$PATH"
@@ -91,17 +96,27 @@ reset_no_change() {
 # Pre-flight Check
 # ============================================
 
-check_github_release() {
-    log "Checking GitHub for latest release..."
+# The upstream CHANGELOG is the source of truth: GitHub Releases silently omits
+# versions that shipped and sometimes publishes an empty body, so a releases-only
+# trigger can miss a release entirely. Releases stay as a fallback for the trigger.
+check_upstream_version() {
+    log "Checking upstream CHANGELOG for latest version..."
 
     local latest_release
-    latest_release=$(curl -sf "https://api.github.com/repos/anthropics/claude-code/releases/latest" 2>/dev/null | jq -r '.tag_name // ""') || {
-        log "Could not fetch GitHub releases (network issue?) - continuing with full check"
-        return 0  # Continue on error
-    }
+    latest_release=$(curl -sf "$CHANGELOG_URL" 2>/dev/null | grep -m1 '^## ' | sed 's/^##[[:space:]]*//; s/[[:space:]]*$//') || true
+
+    if [ -n "$latest_release" ]; then
+        latest_release="v${latest_release#v}"
+    else
+        log "Could not read CHANGELOG (network issue?) - falling back to GitHub releases"
+        latest_release=$(curl -sf "https://api.github.com/repos/anthropics/claude-code/releases/latest" 2>/dev/null | jq -r '.tag_name // ""') || {
+            log "Could not fetch GitHub releases either - continuing with full check"
+            return 0  # Continue on error
+        }
+    fi
 
     if [ -z "$latest_release" ]; then
-        log "No release found - continuing with full check"
+        log "No version found - continuing with full check"
         return 0
     fi
 
@@ -112,18 +127,18 @@ check_github_release() {
         local no_change_count
         no_change_count=$(jq -r ".consecutive_no_change // 0" "$STATE_FILE")
 
-        # Force full check every 5 runs even if no new release (catch doc updates)
+        # Force full check every 5 runs even if no new version (catch doc updates)
         if [ "$no_change_count" -lt 5 ]; then
-            log "No new release (current: $latest_release). Skipping full check."
+            log "No new version (current: $latest_release). Skipping full check."
             increment_no_change
             set_state "last_check" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
             return 1  # Skip
         else
-            log "No new release but forcing periodic full check (run #$no_change_count)"
+            log "No new version but forcing periodic full check (run #$no_change_count)"
         fi
     fi
 
-    log "New release detected: $latest_release (was: ${last_release:-none})"
+    log "New version detected: $latest_release (was: ${last_release:-none})"
     set_state "last_release" "$latest_release"
     return 0  # Continue
 }
@@ -162,8 +177,14 @@ run_claude_update() {
 You are updating the Claude Code Guide (README.md in this directory). Your task:
 
 ## 1. CHECK SOURCES for updates about Claude Code:
+- https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md
+  PRIMARY SOURCE. Take the version list and the per-version bullets from here.
 - https://docs.anthropic.com/en/docs/claude-code/overview (official docs)
-- https://github.com/anthropics/claude-code/releases (GitHub releases/changelog)
+- https://github.com/anthropics/claude-code/releases
+  SECONDARY ONLY - use it for publish dates, never as the version list. It omits
+  versions that shipped (e.g. v2.1.43, v2.1.46, v2.1.120) and some entries have an
+  empty body (e.g. v2.1.75, which has 19 CHANGELOG items). If a version has no
+  GitHub release, take its date from the npm registry publish time instead.
 - https://www.anthropic.com/changelog (product changelog - filter for Claude Code)
 
 ## 2. UPDATE the README.md with any:
@@ -175,6 +196,10 @@ You are updating the Claude Code Guide (README.md in this directory). Your task:
 - New examples or patterns
 
 ## 3. QUALITY CHECK - Review and fix if needed:
+- Every CHANGELOG.md version in the covered range has a guide entry, unless its only
+  notes are bug-fix/reliability boilerplate (existing practice)
+- Each bullet sits under the version that CHANGELOG.md attributes it to
+- Version entries are strictly descending with no duplicates
 - Broken internal links (anchors that don't match headers)
 - Unbalanced code fences (``` must be paired)
 - Outdated information
@@ -320,9 +345,9 @@ main() {
     init_state
     init_changes_log
 
-    # Pre-flight: Check if there's a new release
-    if ! check_github_release; then
-        log "Skipping full check (no new release)"
+    # Pre-flight: Check if there's a new version in the upstream CHANGELOG
+    if ! check_upstream_version; then
+        log "Skipping full check (no new version)"
         echo "=========================================="
         exit 0
     fi
